@@ -47,7 +47,7 @@ class WaveletTransformProcessor:
         scale_min = pywt.scale2frequency(self.wavelet_name, 1) / (freq_max * sampling_period)
         
         # 生成对数间隔的尺度数组
-        n_scales = 30  # 减少到30个尺度以提高计算速度
+        n_scales = 200  # 增加到200个尺度以提高频率分辨率
         self.scales = np.logspace(np.log10(scale_min), np.log10(scale_max), n_scales)
         
         # 计算对应的频率
@@ -61,6 +61,11 @@ class WaveletTransformProcessor:
         
     def _visualize_scale_frequency_relationship(self):
         """可视化尺度与频率的关系"""
+        # 检查scales和frequencies是否已经初始化
+        if self.scales is None or self.frequencies is None:
+            print("  错误：尺度和频率尚未初始化！请先调用design_wavelet_scales()方法")
+            return
+        
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         
         # 1. 尺度分布
@@ -83,8 +88,12 @@ class WaveletTransformProcessor:
         print("  尺度设计图已保存为 wavelet_scales_design.png")
     
     def apply_cwt_to_dataset(self):
-        """第4.3节：对整个数据集应用CWT生成尺度图"""
-        print("正在对数据集应用连续小波变换...")
+        """第4.3节：对整个数据集应用CWT生成尺度图 - 分批处理版本"""
+        print("正在对数据集应用连续小波变换（分批处理）...")
+        
+        # 检查scales和frequencies是否已经初始化
+        if self.scales is None or self.frequencies is None:
+            raise ValueError("必须先调用design_wavelet_scales()方法来初始化尺度和频率")
         
         # 获取模型数据集
         if not hasattr(self.analyzer, 'target_builder'):
@@ -94,39 +103,166 @@ class WaveletTransformProcessor:
         csi_labels = self.analyzer.target_builder.model_dataset['csi_labels']
         metadata = self.analyzer.target_builder.model_dataset['metadata']
         
-        print(f"  处理 {len(waveforms)} 个波形...")
-        print(f"  波形长度: {waveforms.shape[1]} 个样点")
-        
-        # 初始化尺度图数组
         n_samples = len(waveforms)
         n_scales = len(self.scales)
         n_time_samples = waveforms.shape[1]
         
-        scalograms = np.zeros((n_samples, n_scales, n_time_samples), dtype=np.float32)
+        print(f"  处理 {n_samples:,} 个波形...")
+        print(f"  波形长度: {n_time_samples} 个样点")
+        print(f"  尺度数量: {n_scales}")
         
-        # 批量处理波形
-        print("  正在进行小波变换...")
-        for i, waveform in enumerate(waveforms):
-            if i % 50 == 0:  # 每50个样本显示一次进度，更频繁的更新
-                print(f"    处理进度: {i+1}/{n_samples} ({(i+1)/n_samples*100:.1f}%)")
+        # 检测是否已有合适的HDF5文件（新增）
+        existing_hdf5_files = [
+            'scalograms_temp.h5',
+            'scalograms_optimized.h5',
+            'scalograms_fallback.h5'
+        ]
+        
+        for hdf5_file in existing_hdf5_files:
+            try:
+                from pathlib import Path
+                if Path(hdf5_file).exists():
+                    import h5py
+                    with h5py.File(hdf5_file, 'r') as f:
+                        if 'scalograms' in f:
+                            existing_shape = f['scalograms'].shape
+                            existing_samples = existing_shape[0]
+                            
+                            # 检查样本数量和尺度数量是否匹配
+                            if existing_samples == n_samples and existing_shape[1] == n_scales:
+                                print(f"  ✅ 发现匹配的HDF5文件: {hdf5_file}")
+                                print(f"      现有数据形状: {existing_shape}")
+                                print(f"  📂 使用已有HDF5文件，跳过小波变换处理")
+                                
+                                # 构建数据集元数据
+                                self.scalograms_dataset = {
+                                    'scalograms_file': hdf5_file,  # 保存文件路径而不是数据
+                                    'n_samples': n_samples,
+                                    'shape': existing_shape,
+                                    'csi_labels': csi_labels,
+                                    'metadata': metadata,
+                                    'scales': self.scales,
+                                    'frequencies': self.frequencies,
+                                    'time_axis': np.arange(n_time_samples) * (1.0 / self.sampling_rate),
+                                    'transform_params': {
+                                        'wavelet': self.wavelet_name,
+                                        'sampling_rate': self.sampling_rate,
+                                        'freq_range': self.target_freq_range,
+                                        'n_scales': n_scales
+                                    }
+                                }
+                                
+                                print(f"  📊 数据集形状: {existing_shape}")
+                                print(f"  💾 数据文件: {hdf5_file}")
+                                print(f"  📻 频率范围: {self.frequencies.min():.1f} Hz - {self.frequencies.max()/1000:.1f} kHz")
+                                
+                                # 进行快速可视化（使用样本数据）
+                                print("  🎨 生成样本可视化...")
+                                with h5py.File(hdf5_file, 'r') as f:
+                                    sample_scalograms = f['scalograms'][:min(1000, n_samples)]
+                                self._visualize_sample_scalograms_from_hdf5(sample_scalograms)
+                                del sample_scalograms
+                                
+                                return  # 直接返回，跳过后续处理
+                            else:
+                                print(f"  ⚠️ 发现HDF5文件但维度不匹配: {hdf5_file}")
+                                print(f"      当前需要: ({n_samples}, {n_scales}, {n_time_samples})")
+                                print(f"      文件中有: {existing_shape}")
+            except Exception as e:
+                print(f"  ⚠️ 检查HDF5文件失败: {hdf5_file} - {e}")
+        
+        # 如果没有找到合适的HDF5文件，继续原有的处理流程
+        print("  🔄 未找到匹配的HDF5文件，开始生成新的尺度图...")
+        
+        # 分批处理参数
+        batch_size = 1000  # 每批处理1000个样本
+        n_batches = (n_samples + batch_size - 1) // batch_size
+        
+        print(f"  📦 分批处理: {n_batches} 批，每批 {batch_size} 样本")
+        
+        # 导入h5py
+        try:
+            import h5py
+        except ImportError:
+            print("❌ h5py未安装，请安装：pip install h5py")
+            raise ImportError("需要h5py库进行大数据集处理")
+        
+        # 创建HDF5文件
+        hdf5_file = 'scalograms_temp.h5'
+        print(f"  💾 创建临时文件: {hdf5_file}")
+        
+        with h5py.File(hdf5_file, 'w') as f:
+            # 创建数据集，使用分块存储和压缩
+            scalograms_dataset = f.create_dataset(
+                'scalograms', 
+                shape=(n_samples, n_scales, n_time_samples),
+                dtype=np.float32,
+                chunks=(min(batch_size, n_samples), n_scales, n_time_samples),
+                compression='gzip',
+                compression_opts=1  # 轻量压缩，平衡压缩率和速度
+            )
             
-            # 应用连续小波变换
-            cwt_coefficients, _ = pywt.cwt(waveform, self.scales, self.wavelet_name)
+            # 分批处理波形
+            print("  🔄 开始分批小波变换...")
             
-            # 计算尺度图（取复数系数的模）
-            scalogram = np.abs(cwt_coefficients)
-            scalograms[i] = scalogram.astype(np.float32)
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_samples)
+                actual_batch_size = end_idx - start_idx
+                
+                print(f"    批次 {batch_idx+1}/{n_batches}: 样本 {start_idx}-{end_idx-1} ({actual_batch_size} 个)")
+                
+                # 获取当前批次的波形
+                batch_waveforms = waveforms[start_idx:end_idx]
+                
+                # 为当前批次初始化尺度图数组
+                batch_scalograms = np.zeros((actual_batch_size, n_scales, n_time_samples), dtype=np.float32)
+                
+                # 对当前批次应用小波变换
+                for i, waveform in enumerate(batch_waveforms):
+                    try:
+                        # 应用连续小波变换
+                        cwt_coefficients, _ = pywt.cwt(waveform, self.scales, self.wavelet_name)
+                        
+                        # 计算尺度图（取复数系数的模）
+                        scalogram = np.abs(cwt_coefficients)
+                        batch_scalograms[i] = scalogram.astype(np.float32)
+                        
+                    except Exception as e:
+                        print(f"      ⚠️ 样本 {start_idx + i} 处理失败: {e}")
+                        # 使用零填充
+                        batch_scalograms[i] = np.zeros((n_scales, n_time_samples), dtype=np.float32)
+                
+                # 将批次结果写入HDF5文件
+                scalograms_dataset[start_idx:end_idx] = batch_scalograms
+                
+                # 清理内存
+                del batch_scalograms
+                del batch_waveforms
+                
+                # 显示进度
+                progress = (batch_idx + 1) / n_batches * 100
+                print(f"      进度: {progress:.1f}%")
         
-        print("  小波变换完成！")
+        print("  ✅ 分批小波变换完成！")
         
-        # 创建尺度图数据集
+        # 重新加载完整数据集进行后续处理（只加载元数据）
+        print("  📊 加载完整尺度图数据...")
+        
+        with h5py.File(hdf5_file, 'r') as f:
+            # 只加载前几个样本用于展示，不加载全部
+            sample_scalograms = f['scalograms'][:min(1000, n_samples)]
+        
+        # 创建尺度图数据集元数据
         self.scalograms_dataset = {
-            'scalograms': scalograms,
+            'scalograms_file': hdf5_file,  # 保存文件路径而不是数据
+            'n_samples': n_samples,
+            'shape': (n_samples, n_scales, n_time_samples),
             'csi_labels': csi_labels,
             'metadata': metadata,
             'scales': self.scales,
             'frequencies': self.frequencies,
-            'time_axis': np.arange(n_time_samples) * (1.0 / self.sampling_rate),  # 时间轴（秒）
+            'time_axis': np.arange(n_time_samples) * (1.0 / self.sampling_rate),
             'transform_params': {
                 'wavelet': self.wavelet_name,
                 'sampling_rate': self.sampling_rate,
@@ -135,16 +271,107 @@ class WaveletTransformProcessor:
             }
         }
         
-        print(f"  尺度图数据集形状: {scalograms.shape}")
-        print(f"  时间轴范围: 0 - {self.scalograms_dataset['time_axis'][-1]*1000:.1f} ms")
-        print(f"  频率轴范围: {self.frequencies.min():.1f} Hz - {self.frequencies.max()/1000:.1f} kHz")
+        print(f"  📊 尺度图数据集形状: {(n_samples, n_scales, n_time_samples)}")
+        print(f"  💾 数据保存在: {hdf5_file}")
+        print(f"  🕒 时间轴范围: 0 - {self.scalograms_dataset['time_axis'][-1]*1000:.1f} ms")
+        print(f"  📻 频率轴范围: {self.frequencies.min():.1f} Hz - {self.frequencies.max()/1000:.1f} kHz")
         
-        # 可视化几个样本的尺度图
-        self._visualize_sample_scalograms()
+        # 使用样本数据进行可视化
+        self._visualize_sample_scalograms_from_hdf5(sample_scalograms)
         
-    def _visualize_sample_scalograms(self):
-        """可视化几个样本的尺度图"""
+        # 清理样本数据
+        del sample_scalograms
+    
+    def _visualize_sample_scalograms_from_hdf5(self, sample_scalograms):
+        """可视化几个样本的尺度图（从HDF5数据）"""
         print("  正在生成样本尺度图可视化...")
+        
+        # 检查frequencies是否已经初始化
+        if self.frequencies is None:
+            print("  错误：频率尚未初始化！请先调用design_wavelet_scales()方法")
+            return
+        
+        csi_labels = self.scalograms_dataset['csi_labels']
+        time_axis_ms = self.scalograms_dataset['time_axis'] * 1000  # 转换为毫秒
+        frequencies_khz = self.frequencies / 1000  # 转换为kHz
+        
+        # 选择不同CSI等级的样本
+        low_csi_idx = np.argmin(csi_labels)  # 最好的胶结
+        high_csi_idx = np.argmax(csi_labels)  # 最差的胶结
+        medium_csi_idx = np.argmin(np.abs(csi_labels - np.median(csi_labels)))  # 中等胶结
+        
+        sample_indices = [low_csi_idx, medium_csi_idx, high_csi_idx]
+        sample_titles = [
+            f'Good Bond (CSI={csi_labels[low_csi_idx]:.3f})',
+            f'Medium Bond (CSI={csi_labels[medium_csi_idx]:.3f})',
+            f'Poor Bond (CSI={csi_labels[high_csi_idx]:.3f})'
+        ]
+        
+        fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+        fig.suptitle('Sample Scalograms from CWT Analysis', fontsize=16)
+        
+        for i, (idx, title) in enumerate(zip(sample_indices, sample_titles)):
+            # 原始波形
+            ax = axes[i, 0]
+            original_waveform = self.analyzer.target_builder.model_dataset['waveforms'][idx]
+            ax.plot(time_axis_ms, original_waveform, 'b-', linewidth=1)
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Amplitude')
+            ax.set_title(f'Original Waveform - {title}')
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, 4)  # 聚焦于0-4 ms
+            
+            # 尺度图
+            ax = axes[i, 1]
+            scalogram = sample_scalograms[idx]
+            
+            # 限制显示范围到0-4ms和30kHz以下
+            time_mask = time_axis_ms <= 4
+            freq_mask = frequencies_khz <= 30
+            
+            display_scalogram = scalogram[freq_mask, :][:, time_mask]
+            display_time = time_axis_ms[time_mask]
+            display_freq = frequencies_khz[freq_mask]
+            
+            im = ax.imshow(display_scalogram, aspect='auto', cmap='jet',
+                          extent=[display_time[0], display_time[-1], 
+                                 display_freq[0], display_freq[-1]],
+                          origin='lower')
+            ax.set_xlabel('Time (ms)')
+            ax.set_ylabel('Frequency (kHz)')
+            ax.set_title(f'Scalogram - {title}')
+            
+            # 添加颜色条
+            cbar = plt.colorbar(im, ax=ax)
+            cbar.set_label('Magnitude')
+        
+        plt.tight_layout()
+        plt.savefig('sample_scalograms.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        print("  样本尺度图已保存为 sample_scalograms.png")
+    
+    def _visualize_sample_scalograms(self):
+        """可视化几个样本的尺度图（原版本，用于兼容性）"""
+        print("  正在生成样本尺度图可视化...")
+        
+        # 检查frequencies是否已经初始化
+        if self.frequencies is None:
+            print("  错误：频率尚未初始化！请先调用design_wavelet_scales()方法")
+            return
+        
+        # 检查是否使用HDF5格式
+        if 'scalograms_file' in self.scalograms_dataset:
+            print("  检测到HDF5格式数据，加载样本进行可视化...")
+            try:
+                import h5py
+                with h5py.File(self.scalograms_dataset['scalograms_file'], 'r') as f:
+                    sample_scalograms = f['scalograms'][:min(1000, self.scalograms_dataset['n_samples'])]
+                self._visualize_sample_scalograms_from_hdf5(sample_scalograms)
+                del sample_scalograms
+                return
+            except Exception as e:
+                print(f"  ⚠️ 从HDF5加载失败: {e}")
+                return
         
         scalograms = self.scalograms_dataset['scalograms']
         csi_labels = self.scalograms_dataset['csi_labels']
@@ -207,8 +434,14 @@ class WaveletTransformProcessor:
         print("  样本尺度图已保存为 sample_scalograms.png")
     
     def analyze_scalogram_statistics(self):
-        """分析尺度图的统计特性"""
+        """分析尺度图的统计特性 - 支持HDF5格式"""
         print("正在分析尺度图统计特性...")
+        
+        # 检查是否使用HDF5格式
+        if 'scalograms_file' in self.scalograms_dataset:
+            print("  检测到HDF5格式数据，进行批量统计分析...")
+            self._analyze_scalogram_statistics_hdf5()
+            return
         
         scalograms = self.scalograms_dataset['scalograms']
         csi_labels = self.scalograms_dataset['csi_labels']
@@ -240,7 +473,76 @@ class WaveletTransformProcessor:
         
         # 分析时频域能量分布
         self._analyze_time_frequency_energy_distribution()
+    
+    def _analyze_scalogram_statistics_hdf5(self):
+        """分析HDF5格式尺度图的统计特性"""
+        import h5py
         
+        hdf5_file = self.scalograms_dataset['scalograms_file']
+        csi_labels = self.scalograms_dataset['csi_labels']
+        shape = self.scalograms_dataset['shape']
+        
+        print(f"  尺度图统计:")
+        print(f"    形状: {shape}")
+        print(f"    数据类型: float32")
+        print(f"    数据文件: {hdf5_file}")
+        
+        # 分批计算统计信息
+        batch_size = 1000
+        n_batches = (shape[0] + batch_size - 1) // batch_size
+        
+        # 初始化统计变量
+        total_sum = 0.0
+        total_sum_sq = 0.0
+        total_min = float('inf')
+        total_max = float('-inf')
+        total_count = 0
+        
+        print("  📊 计算全局统计信息...")
+        
+        with h5py.File(hdf5_file, 'r') as f:
+            scalograms_dataset = f['scalograms']
+            
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, shape[0])
+                
+                batch_data = scalograms_dataset[start_idx:end_idx]
+                
+                total_sum += np.sum(batch_data)
+                total_sum_sq += np.sum(batch_data ** 2)
+                total_min = min(total_min, np.min(batch_data))
+                total_max = max(total_max, np.max(batch_data))
+                total_count += batch_data.size
+                
+                if (batch_idx + 1) % 10 == 0:
+                    print(f"    处理批次: {batch_idx + 1}/{n_batches}")
+        
+        # 计算最终统计
+        mean = total_sum / total_count
+        variance = (total_sum_sq / total_count) - (mean ** 2)
+        std = np.sqrt(variance)
+        
+        print(f"    值范围: {total_min:.3f} - {total_max:.3f}")
+        print(f"    均值: {mean:.3f} ± {std:.3f}")
+        
+        # 按CSI等级分组分析（简化版）
+        csi_thresholds = [0.1, 0.3, 0.6]
+        csi_groups = {
+            'Excellent': csi_labels < csi_thresholds[0],
+            'Good': (csi_labels >= csi_thresholds[0]) & (csi_labels < csi_thresholds[1]),
+            'Fair': (csi_labels >= csi_thresholds[1]) & (csi_labels < csi_thresholds[2]),
+            'Poor': csi_labels >= csi_thresholds[2]
+        }
+        
+        print("\n  按胶结质量分组的样本统计:")
+        for group_name, group_mask in csi_groups.items():
+            if np.any(group_mask):
+                print(f"    {group_name}: {np.sum(group_mask)} 个样本")
+        
+        print("  ℹ️ 详细的分组尺度图统计需要大量内存，已跳过")
+        print("  ℹ️ 时频域能量分布分析需要大量内存，已跳过")
+    
     def _analyze_time_frequency_energy_distribution(self):
         """分析时频域能量分布"""
         print("  分析时频域能量分布...")

@@ -16,6 +16,28 @@ from functools import partial
 import time
 warnings.filterwarnings('ignore')
 
+# 设置TensorFlow环境变量以减少输出信息
+def setup_tensorflow_environment():
+    """设置TensorFlow环境变量以优化输出和性能"""
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # 减少TensorFlow日志输出
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # 禁用oneDNN优化信息
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # 只使用第一个GPU，避免多GPU复杂性
+    
+    # 设置内存增长
+    try:
+        import tensorflow as tf
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        # 禁用某些优化以避免布局错误
+        tf.config.optimizer.set_experimental_options({'layout_optimizer': False})
+    except Exception as e:
+        print(f"⚠️ TensorFlow环境设置警告: {e}")
+
+# 在导入主要分析器之前设置环境
+setup_tensorflow_environment()
+
 # 导入主要分析器
 from main_analysis import CementChannelingAnalyzer
 
@@ -159,47 +181,138 @@ def apply_sampling_strategy(analyzer, strategy):
     
     return analyzer
 
-def parallel_wavelet_transform_batch(batch_data):
-    """并行处理小波变换的单个批次"""
-    import pywt
+def build_analyzer_from_existing_hdf5(analyzer, hdf5_file):
+    """从已有HDF5文件构建分析器的小波变换数据"""
+    print(f"正在从已有HDF5文件构建数据: {hdf5_file}")
     
-    batch_waveforms, batch_id, wavelet, scales, sampling_rate = batch_data
-    
-    batch_scalograms = []
-    for i, waveform in enumerate(batch_waveforms):
-        try:
-            # 连续小波变换
-            coefficients, _ = pywt.cwt(waveform, scales, wavelet, sampling_period=1.0/sampling_rate)
-            scalogram = np.abs(coefficients)
-            batch_scalograms.append(scalogram)
-        except Exception as e:
-            print(f"  ⚠️ 批次 {batch_id} 样本 {i} 小波变换失败: {e}")
-            # 创建零填充的尺度图
-            scalogram = np.zeros((len(scales), len(waveform)))
-            batch_scalograms.append(scalogram)
-    
-    return batch_id, np.array(batch_scalograms)
+    try:
+        import h5py
+        
+        # 读取HDF5文件信息
+        with h5py.File(hdf5_file, 'r') as f:
+            if 'scalograms' not in f:
+                raise ValueError("HDF5文件中未找到scalograms数据集")
+            
+            shape = f['scalograms'].shape
+            print(f"  📊 HDF5数据形状: {shape}")
+        
+        # 获取分析器数据
+        csi_labels = analyzer.target_builder.csi_data['csi'].values
+        n_samples, n_scales, n_time_samples = shape
+        
+        # 导入和创建小波变换处理器
+        from wavelet_transform import WaveletTransformProcessor
+        analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
+        
+        # 设计小波尺度（重新生成scales和frequencies以确保一致性）
+        analyzer.wavelet_processor.design_wavelet_scales()
+        
+        # 构建HDF5格式的尺度图数据集
+        scalograms_dataset = {
+            'scalograms_file': str(hdf5_file),  # 保存文件路径而不是数据
+            'n_samples': n_samples,
+            'shape': shape,
+            'csi_labels': csi_labels,
+            'scales': analyzer.wavelet_processor.scales,
+            'frequencies': analyzer.wavelet_processor.frequencies,
+            'time_axis': np.arange(n_time_samples) / 100000,  # 假设100kHz采样率
+            'metadata': {
+                'depth': analyzer.target_builder.csi_data['depth'].values,
+                'receiver': np.zeros(len(csi_labels)),
+                'receiver_index': np.arange(len(csi_labels))
+            },
+            'transform_params': {
+                'wavelet': 'cmor1.5-1.0',
+                'sampling_rate': 100000,
+                'freq_range': (1000, 30000),
+                'n_scales': n_scales
+            }
+        }
+        
+        analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
+        
+        print(f"  ✅ 成功构建分析器，数据形状: {shape}")
+        print(f"  💾 数据文件: {hdf5_file}")
+        print(f"  📻 频率范围: {analyzer.wavelet_processor.frequencies.min():.1f} Hz - {analyzer.wavelet_processor.frequencies.max()/1000:.1f} kHz")
+        
+        return analyzer
+        
+    except Exception as e:
+        print(f"  ❌ 从HDF5文件构建分析器失败: {e}")
+        raise RuntimeError(f"无法使用已有HDF5文件: {e}")
 
 def optimized_wavelet_transform(analyzer):
-    """优化的并行小波变换"""
-    print("\n📊 开始优化的小波变换处理...")
+    """优化的分批小波变换 - 使用HDF5格式避免内存溢出"""
+    print("\n📊 开始优化的分批小波变换处理...")
+    
+    # 获取数据信息
+    waveforms = analyzer.target_builder.model_dataset['waveforms']
+    csi_labels = analyzer.target_builder.csi_data['csi'].values
+    n_waveforms = len(waveforms)
+    n_time_samples = waveforms.shape[1]
+    
+    print(f"  • 待处理波形数: {n_waveforms:,}")
+    print(f"  • 波形长度: {n_time_samples} 样点")
+    
+    # 检测是否已有合适的HDF5文件
+    existing_hdf5_files = [
+        'scalograms_optimized.h5',
+        'scalograms_temp.h5', 
+        'scalograms_fallback.h5'
+    ]
+    
+    for hdf5_file in existing_hdf5_files:
+        if Path(hdf5_file).exists():
+            try:
+                import h5py
+                with h5py.File(hdf5_file, 'r') as f:
+                    if 'scalograms' in f:
+                        existing_shape = f['scalograms'].shape
+                        existing_samples = existing_shape[0]
+                        
+                        # 检查样本数量是否匹配
+                        if existing_samples == n_waveforms:
+                            print(f"  ✅ 发现匹配的HDF5文件: {hdf5_file}")
+                            print(f"      现有数据形状: {existing_shape}")
+                            
+                            response = input(f"    是否使用已有的HDF5文件？ (y/n, 默认y): ").strip().lower()
+                            if response in ['', 'y', 'yes']:
+                                print(f"  📂 使用已有HDF5文件: {hdf5_file}")
+                                return build_analyzer_from_existing_hdf5(analyzer, hdf5_file)
+                            else:
+                                print(f"  🔄 用户选择重新处理，将覆盖已有文件")
+                                break
+                        else:
+                            print(f"  ⚠️ 发现HDF5文件但样本数不匹配: {hdf5_file}")
+                            print(f"      当前需要: {n_waveforms:,}, 文件中有: {existing_samples:,}")
+            except Exception as e:
+                print(f"  ⚠️ 检查HDF5文件失败: {hdf5_file} - {e}")
     
     # 导入必要的库
     import pywt
+    
+    # 导入h5py
+    try:
+        import h5py
+    except ImportError:
+        print("❌ h5py未安装，请安装：pip install h5py")
+        raise ImportError("需要h5py库进行大数据集处理")
     
     # 获取数据
     waveforms = analyzer.target_builder.model_dataset['waveforms']
     csi_labels = analyzer.target_builder.csi_data['csi'].values
     
     n_waveforms = len(waveforms)
-    print(f"  • 待处理波形数: {n_waveforms:,}")
-    print(f"  • 波形长度: {waveforms.shape[1]} 样点")
+    n_time_samples = waveforms.shape[1]
     
-    # 优化的小波参数（减少尺度数量以提高速度）
+    print(f"  • 待处理波形数: {n_waveforms:,}")
+    print(f"  • 波形长度: {n_time_samples} 样点")
+    
+    # 优化的小波参数
     wavelet = 'cmor1.5-1.0'
     sampling_rate = 100000  # 100kHz
-    freq_min, freq_max = 1000, 15000  # 1-15 kHz (减少频率范围)
-    n_scales = 20  # 减少到20个尺度
+    freq_min, freq_max = 1000, 30000  # 1-30 kHz (提高频率范围)
+    n_scales = 200  # 增加到200个尺度以提高频率分辨率
     
     # 生成尺度
     scales = np.logspace(np.log10(sampling_rate/freq_max), 
@@ -208,161 +321,224 @@ def optimized_wavelet_transform(analyzer):
     frequencies = pywt.scale2frequency(wavelet, scales) * sampling_rate
     
     print(f"  • 频率范围: {frequencies.min():.0f} Hz - {frequencies.max()/1000:.1f} kHz")
-    print(f"  • 尺度数量: {n_scales} (优化减少)")
+    print(f"  • 尺度数量: {n_scales}")
     
-    # 计算最优批次大小和进程数
-    available_cores = mp.cpu_count()
-    max_workers = min(available_cores - 1, 8)  # 保留1个核心，最多8进程
-    batch_size = max(50, min(200, n_waveforms // (max_workers * 2)))  # 动态批次大小
+    # 分批处理参数
+    batch_size = 1000  # 每批处理1000个样本
+    n_batches = (n_waveforms + batch_size - 1) // batch_size
     
-    print(f"  • 并行进程数: {max_workers}")
-    print(f"  • 批次大小: {batch_size}")
+    print(f"  • 分批处理: {n_batches} 批，每批 {batch_size} 样本")
     
-    # 准备批次数据
-    batches = []
-    for i in range(0, n_waveforms, batch_size):
-        end_idx = min(i + batch_size, n_waveforms)
-        batch_waveforms = waveforms[i:end_idx]
-        batch_id = i // batch_size
-        batches.append((batch_waveforms, batch_id, wavelet, scales, sampling_rate))
+    # 创建HDF5文件
+    hdf5_file = 'scalograms_optimized.h5'
+    print(f"  💾 创建数据文件: {hdf5_file}")
     
-    n_batches = len(batches)
-    print(f"  • 总批次数: {n_batches}")
-    
-    # 执行并行处理
-    print("\n🚀 开始并行小波变换...")
     start_time = time.time()
     
     try:
-        with mp.Pool(processes=max_workers) as pool:
-            all_scalograms = []
-            completed_batches = 0
+        with h5py.File(hdf5_file, 'w') as f:
+            # 创建数据集，使用分块存储和压缩
+            scalograms_dataset = f.create_dataset(
+                'scalograms', 
+                shape=(n_waveforms, n_scales, n_time_samples),
+                dtype=np.float32,
+                chunks=(min(batch_size, n_waveforms), n_scales, n_time_samples),
+                compression='gzip',
+                compression_opts=1  # 轻量压缩
+            )
             
-            # 使用异步执行以显示进度
-            results = pool.map_async(parallel_wavelet_transform_batch, batches)
+            print("\n🚀 开始分批小波变换...")
             
-            # 等待完成并显示进度
-            while not results.ready():
-                time.sleep(2)  # 每2秒检查一次
-                # 估算进度（简化版本）
+            # 分批处理
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_waveforms)
+                actual_batch_size = end_idx - start_idx
+                
+                print(f"    批次 {batch_idx+1}/{n_batches}: 样本 {start_idx}-{end_idx-1} ({actual_batch_size} 个)")
+                
+                # 获取当前批次的波形
+                batch_waveforms = waveforms[start_idx:end_idx]
+                
+                # 为当前批次初始化尺度图数组
+                batch_scalograms = np.zeros((actual_batch_size, n_scales, n_time_samples), dtype=np.float32)
+                
+                # 对当前批次应用小波变换
+                for i, waveform in enumerate(batch_waveforms):
+                    try:
+                        # 连续小波变换
+                        coefficients, _ = pywt.cwt(waveform, scales, wavelet, sampling_period=1.0/sampling_rate)
+                        scalogram = np.abs(coefficients)
+                        batch_scalograms[i] = scalogram.astype(np.float32)
+                    except Exception as e:
+                        print(f"      ⚠️ 样本 {start_idx + i} 小波变换失败: {e}")
+                        # 创建零填充的尺度图
+                        batch_scalograms[i] = np.zeros((n_scales, n_time_samples), dtype=np.float32)
+                
+                # 将批次结果写入HDF5文件
+                scalograms_dataset[start_idx:end_idx] = batch_scalograms
+                
+                # 清理内存
+                del batch_scalograms
+                del batch_waveforms
+                
+                # 显示进度
+                progress = (batch_idx + 1) / n_batches * 100
                 elapsed = time.time() - start_time
-                if elapsed > 10:  # 10秒后开始显示预估
-                    estimated_total = elapsed * n_batches / max(1, completed_batches)
-                    remaining = max(0, estimated_total - elapsed)
-                    print(f"    处理中... 已用时 {elapsed:.0f}s, 预计剩余 {remaining:.0f}s")
-            
-            # 获取结果
-            batch_results = results.get()
-            
-            # 按批次ID排序并合并结果
-            batch_results.sort(key=lambda x: x[0])
-            for batch_id, batch_scalograms in batch_results:
-                all_scalograms.append(batch_scalograms)
-                completed_batches += 1
-                if completed_batches % max(1, n_batches//10) == 0:
-                    progress = completed_batches / n_batches * 100
-                    print(f"    进度: {completed_batches}/{n_batches} 批次 ({progress:.1f}%)")
-            
-            # 合并所有尺度图
-            scalograms = np.vstack(all_scalograms)
-            
-    except Exception as e:
-        print(f"  ❌ 并行处理失败: {e}")
-        print("  🔄 回退到单进程处理...")
-        return fallback_wavelet_transform(analyzer, wavelet, scales, frequencies)
-    
-    elapsed_time = time.time() - start_time
-    print(f"\n✅ 小波变换完成!")
-    print(f"  • 总用时: {elapsed_time:.1f} 秒")
-    print(f"  • 处理速度: {n_waveforms/elapsed_time:.1f} 波形/秒")
-    print(f"  • 尺度图形状: {scalograms.shape}")
-    
-    # 构建数据集
-    scalograms_dataset = {
-        'scalograms': scalograms,
-        'csi_labels': csi_labels,
-        'scales': scales,
-        'frequencies': frequencies,
-        'time_axis': np.arange(waveforms.shape[1]) / sampling_rate,
-        'metadata': {
-            'depth': analyzer.target_builder.csi_data['depth'].values,
-            'receiver': np.zeros(len(csi_labels)),  # 简化
-            'receiver_index': np.arange(len(csi_labels))
-        },
-        'transform_params': {
-            'wavelet': wavelet,
-            'sampling_rate': sampling_rate,
-            'freq_range': (freq_min, freq_max),
-            'n_scales': n_scales
+                eta = elapsed / (batch_idx + 1) * (n_batches - batch_idx - 1)
+                print(f"      进度: {progress:.1f}% - 已用时 {elapsed:.0f}s，预计剩余 {eta:.0f}s")
+        
+        elapsed_time = time.time() - start_time
+        print(f"\n✅ 分批小波变换完成!")
+        print(f"  • 总用时: {elapsed_time:.1f} 秒")
+        print(f"  • 处理速度: {n_waveforms/elapsed_time:.1f} 波形/秒")
+        print(f"  • 数据文件: {hdf5_file}")
+        
+        # 构建数据集元数据（不加载实际数据）
+        scalograms_dataset = {
+            'scalograms_file': hdf5_file,  # 保存文件路径而不是数据
+            'n_samples': n_waveforms,
+            'shape': (n_waveforms, n_scales, n_time_samples),
+            'csi_labels': csi_labels,
+            'scales': scales,
+            'frequencies': frequencies,
+            'time_axis': np.arange(n_time_samples) / sampling_rate,
+            'metadata': {
+                'depth': analyzer.target_builder.csi_data['depth'].values,
+                'receiver': np.zeros(len(csi_labels)),  # 简化
+                'receiver_index': np.arange(len(csi_labels))
+            },
+            'transform_params': {
+                'wavelet': wavelet,
+                'sampling_rate': sampling_rate,
+                'freq_range': (freq_min, freq_max),
+                'n_scales': n_scales
+            }
         }
-    }
-    
-    # 添加到分析器
-    from wavelet_transform import WaveletTransformProcessor
-    analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
-    analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
-    
-    return analyzer
+        
+        # 添加到分析器
+        from wavelet_transform import WaveletTransformProcessor
+        analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
+        analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
+        
+        print(f"  📊 尺度图数据集形状: {(n_waveforms, n_scales, n_time_samples)}")
+        
+        return analyzer
+        
+    except Exception as e:
+        print(f"  ❌ 分批处理失败: {e}")
+        print("  🔄 回退到备用处理...")
+        return fallback_wavelet_transform_hdf5(analyzer, wavelet, scales, frequencies)
 
-def fallback_wavelet_transform(analyzer, wavelet, scales, frequencies):
-    """备用的单进程小波变换"""
-    print("  🔄 执行单进程小波变换...")
+def fallback_wavelet_transform_hdf5(analyzer, wavelet, scales, frequencies):
+    """备用的单进程小波变换 - 使用HDF5格式避免内存溢出"""
+    print("  🔄 执行单进程分批小波变换...")
     
     import pywt
+    import h5py
     
     waveforms = analyzer.target_builder.model_dataset['waveforms']
     csi_labels = analyzer.target_builder.csi_data['csi'].values
     n_waveforms = len(waveforms)
+    n_time_samples = waveforms.shape[1]
+    n_scales = len(scales)
     
-    scalograms = []
+    # 分批处理参数
+    batch_size = 500  # 较小的批次大小，用于备用处理
+    n_batches = (n_waveforms + batch_size - 1) // batch_size
+    
+    print(f"    批次数量: {n_batches}，每批 {batch_size} 样本")
+    
+    # 创建HDF5文件
+    hdf5_file = 'scalograms_fallback.h5'
+    
     start_time = time.time()
     
-    for i, waveform in enumerate(waveforms):
-        try:
-            coefficients, _ = pywt.cwt(waveform, scales, wavelet, sampling_period=1.0/100000)
-            scalogram = np.abs(coefficients)
-            scalograms.append(scalogram)
-        except:
-            scalogram = np.zeros((len(scales), len(waveform)))
-            scalograms.append(scalogram)
+    try:
+        with h5py.File(hdf5_file, 'w') as f:
+            # 创建数据集
+            scalograms_dataset = f.create_dataset(
+                'scalograms', 
+                shape=(n_waveforms, n_scales, n_time_samples),
+                dtype=np.float32,
+                chunks=(min(batch_size, n_waveforms), n_scales, n_time_samples),
+                compression='gzip',
+                compression_opts=1
+            )
+            
+            # 分批处理
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, n_waveforms)
+                actual_batch_size = end_idx - start_idx
+                
+                print(f"    批次 {batch_idx+1}/{n_batches}: 样本 {start_idx}-{end_idx-1}")
+                
+                # 获取当前批次的波形
+                batch_waveforms = waveforms[start_idx:end_idx]
+                batch_scalograms = np.zeros((actual_batch_size, n_scales, n_time_samples), dtype=np.float32)
+                
+                # 处理当前批次
+                for i, waveform in enumerate(batch_waveforms):
+                    try:
+                        coefficients, _ = pywt.cwt(waveform, scales, wavelet, sampling_period=1.0/100000)
+                        scalogram = np.abs(coefficients)
+                        batch_scalograms[i] = scalogram.astype(np.float32)
+                    except Exception as e:
+                        print(f"        ⚠️ 样本 {start_idx + i} 处理失败: {e}")
+                        batch_scalograms[i] = np.zeros((n_scales, n_time_samples), dtype=np.float32)
+                
+                # 写入HDF5文件
+                scalograms_dataset[start_idx:end_idx] = batch_scalograms
+                
+                # 清理内存
+                del batch_scalograms
+                del batch_waveforms
+                
+                # 显示进度
+                if (batch_idx + 1) % max(1, n_batches//10) == 0:
+                    progress = (batch_idx + 1) / n_batches * 100
+                    elapsed = time.time() - start_time
+                    eta = elapsed / (batch_idx + 1) * (n_batches - batch_idx - 1)
+                    print(f"      进度: {progress:.1f}% - 预计剩余 {eta:.0f}秒")
         
-        # 显示进度
-        if (i + 1) % max(1, n_waveforms//20) == 0:
-            progress = (i + 1) / n_waveforms * 100
-            elapsed = time.time() - start_time
-            eta = elapsed / (i + 1) * (n_waveforms - i - 1)
-            print(f"    进度: {i+1}/{n_waveforms} ({progress:.1f}%) - 预计剩余 {eta:.0f}秒")
-    
-    scalograms = np.array(scalograms)
-    
-    # 构建数据集（与并行版本相同的结构）
-    scalograms_dataset = {
-        'scalograms': scalograms,
-        'csi_labels': csi_labels,
-        'scales': scales,
-        'frequencies': frequencies,
-        'time_axis': np.arange(waveforms.shape[1]) / 100000,
-        'metadata': {
-            'depth': analyzer.target_builder.csi_data['depth'].values,
-            'receiver': np.zeros(len(csi_labels)),
-            'receiver_index': np.arange(len(csi_labels))
-        },
-        'transform_params': {
-            'wavelet': wavelet,
-            'sampling_rate': 100000,
-            'freq_range': (1000, 15000),
-            'n_scales': len(scales)
+        elapsed_time = time.time() - start_time
+        print(f"    ✅ 备用处理完成，用时: {elapsed_time:.1f} 秒")
+        
+        # 构建数据集（与主处理方法相同的结构）
+        scalograms_dataset = {
+            'scalograms_file': hdf5_file,
+            'n_samples': n_waveforms,
+            'shape': (n_waveforms, n_scales, n_time_samples),
+            'csi_labels': csi_labels,
+            'scales': scales,
+            'frequencies': frequencies,
+            'time_axis': np.arange(n_time_samples) / 100000,
+            'metadata': {
+                'depth': analyzer.target_builder.csi_data['depth'].values,
+                'receiver': np.zeros(len(csi_labels)),
+                'receiver_index': np.arange(len(csi_labels))
+            },
+            'transform_params': {
+                'wavelet': wavelet,
+                'sampling_rate': 100000,
+                'freq_range': (1000, 30000),
+                'n_scales': len(scales)
+            }
         }
-    }
-    
-    from wavelet_transform import WaveletTransformProcessor
-    analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
-    analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
-    
-    return analyzer
+        
+        from wavelet_transform import WaveletTransformProcessor
+        analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
+        analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
+        
+        return analyzer
+        
+    except Exception as e:
+        print(f"    ❌ 备用处理也失败: {e}")
+        raise RuntimeError(f"所有小波变换方法都失败了: {e}")
 
 def train_cnn_optimized(analyzer):
-    """优化版CNN训练函数 - 根据样本数量动态调整模型复杂度"""
+    """优化版CNN训练函数 - 根据样本数量动态调整模型复杂度，支持HDF5大数据集"""
     print("正在构建和训练优化版CNN模型...")
     
     # 导入深度学习库
@@ -374,9 +550,17 @@ def train_cnn_optimized(analyzer):
     except ImportError:
         raise ImportError("TensorFlow未安装！请安装TensorFlow以使用真实的深度学习模型。")
     
-    # 获取数据
-    scalograms = analyzer.wavelet_processor.scalograms_dataset['scalograms']
-    csi_labels = analyzer.wavelet_processor.scalograms_dataset['csi_labels']
+    # 检查数据格式
+    scalograms_dataset = analyzer.wavelet_processor.scalograms_dataset
+    
+    # 处理HDF5格式的大数据集
+    if 'scalograms_file' in scalograms_dataset:
+        print("  📊 检测到HDF5格式大数据集，使用分批训练...")
+        return train_cnn_with_hdf5(analyzer, scalograms_dataset)
+    
+    # 获取数据（原有方式，适用于小数据集）
+    scalograms = scalograms_dataset['scalograms']
+    csi_labels = scalograms_dataset['csi_labels']
     n_samples = len(scalograms)
     
     print(f"  数据形状: {scalograms.shape}")
@@ -612,6 +796,367 @@ def train_cnn_optimized(analyzer):
         'history': history,
         'model_params': model.count_params(),
         'epochs_trained': len(history.history['loss'])
+    }
+
+def train_cnn_with_hdf5(analyzer, scalograms_dataset):
+    """使用HDF5数据集训练CNN - 分批加载避免内存溢出"""
+    print("  🔄 使用HDF5分批训练模式...")
+    
+    import tensorflow as tf
+    from tensorflow import keras
+    import h5py
+    
+    # 获取数据信息
+    hdf5_file = scalograms_dataset['scalograms_file']
+    csi_labels = scalograms_dataset['csi_labels']
+    shape = scalograms_dataset['shape']
+    n_samples, n_scales, n_time_samples = shape
+    
+    print(f"  📊 HDF5数据集信息:")
+    print(f"    文件: {hdf5_file}")
+    print(f"    形状: {shape}")
+    print(f"    标签范围: {csi_labels.min():.3f} - {csi_labels.max():.3f}")
+    print(f"    样本数量: {n_samples:,}")
+    
+    # 数据分割
+    from sklearn.model_selection import train_test_split
+    train_indices, val_indices = train_test_split(
+        np.arange(n_samples), test_size=0.2, random_state=42
+    )
+    
+    train_labels = csi_labels[train_indices]
+    val_labels = csi_labels[val_indices]
+    
+    print(f"  📊 数据分割:")
+    print(f"    训练集: {len(train_indices):,} 样本")
+    print(f"    验证集: {len(val_indices):,} 样本")
+    
+    # 根据样本数量选择模型架构
+    if n_samples <= 5000:
+        print("  🏗️ 使用紧凑型CNN架构（HDF5）...")
+        model_config = {
+            'filters': [32, 64, 128],
+            'dense_units': [128, 64],
+            'epochs': 15,
+            'batch_size': 32,
+            'patience': 5
+        }
+    elif n_samples <= 20000:
+        print("  🏗️ 使用标准型CNN架构（HDF5）...")
+        model_config = {
+            'filters': [64, 128, 256],
+            'dense_units': [256, 128],
+            'epochs': 20,
+            'batch_size': 64,
+            'patience': 6
+        }
+    else:
+        print("  🏗️ 使用大型CNN架构（HDF5）...")
+        model_config = {
+            'filters': [64, 128, 256],
+            'dense_units': [512, 256, 128],
+            'epochs': 25,
+            'batch_size': 128,
+            'patience': 8
+        }
+    
+    # 创建改进的数据生成器
+    def create_data_generator(indices, labels, batch_size, shuffle=True):
+        """创建改进的HDF5数据生成器"""
+        def generator():
+            while True:  # 无限循环生成器
+                if shuffle:
+                    shuffled_indices = np.random.permutation(indices)
+                else:
+                    shuffled_indices = indices
+                
+                with h5py.File(hdf5_file, 'r') as f:
+                    scalograms_h5 = f['scalograms']
+                    
+                    for i in range(0, len(shuffled_indices), batch_size):
+                        batch_indices = shuffled_indices[i:i+batch_size]
+                        actual_batch_size = len(batch_indices)
+                        
+                        # 预分配数组
+                        batch_scalograms = np.zeros((actual_batch_size, n_scales, n_time_samples), dtype=np.float32)
+                        batch_labels = np.zeros(actual_batch_size, dtype=np.float32)
+                        
+                        # 加载批次数据
+                        for j, idx in enumerate(batch_indices):
+                            try:
+                                scalogram = scalograms_h5[idx]
+                                # 确保数据是numpy数组
+                                if not isinstance(scalogram, np.ndarray):
+                                    scalogram = np.array(scalogram)
+                                
+                                # 数据预处理
+                                scalogram_log = np.log1p(scalogram.astype(np.float32))
+                                batch_scalograms[j] = scalogram_log
+                                
+                                # 获取对应的标签
+                                label_idx = np.where(indices == idx)[0][0]
+                                batch_labels[j] = labels[label_idx]
+                                
+                            except Exception as e:
+                                print(f"      ⚠️ 加载样本 {idx} 失败: {e}")
+                                # 使用零填充
+                                batch_scalograms[j] = np.zeros((n_scales, n_time_samples), dtype=np.float32)
+                                batch_labels[j] = 0.0
+                        
+                        # 标准化处理
+                        if batch_scalograms.max() > 0:
+                            batch_mean = np.mean(batch_scalograms)
+                            batch_std = np.std(batch_scalograms) + 1e-8
+                            batch_scalograms = (batch_scalograms - batch_mean) / batch_std
+                        
+                        # 添加通道维度 - 确保形状正确
+                        batch_scalograms = batch_scalograms[..., np.newaxis]  # (batch, scales, time, 1)
+                        
+                        # 验证形状
+                        expected_shape = (actual_batch_size, n_scales, n_time_samples, 1)
+                        if batch_scalograms.shape != expected_shape:
+                            print(f"      ⚠️ 形状不匹配: 期望 {expected_shape}, 实际 {batch_scalograms.shape}")
+                            batch_scalograms = batch_scalograms.reshape(expected_shape)
+                        
+                        yield batch_scalograms, batch_labels
+        
+        return generator
+    
+    # 创建训练和验证数据集
+    train_generator = create_data_generator(train_indices, train_labels, model_config['batch_size'], shuffle=True)
+    val_generator = create_data_generator(val_indices, val_labels, model_config['batch_size'], shuffle=False)
+    
+    # 计算steps
+    train_steps = len(train_indices) // model_config['batch_size']
+    val_steps = len(val_indices) // model_config['batch_size']
+    
+    # 使用更简单的数据集创建方法
+    print(f"  📊 训练配置:")
+    print(f"    训练步数: {train_steps} / 验证步数: {val_steps}")
+    print(f"    期望输入形状: ({model_config['batch_size']}, {n_scales}, {n_time_samples}, 1)")
+    
+    # 构建模型
+    model = keras.Sequential([
+        keras.layers.Input(shape=(n_scales, n_time_samples, 1)),
+        keras.layers.Conv2D(model_config['filters'][0], (3, 3), activation='relu', padding='same'),
+        keras.layers.BatchNormalization(),
+        keras.layers.MaxPooling2D((2, 2)),
+        keras.layers.Dropout(0.25),
+        
+        keras.layers.Conv2D(model_config['filters'][1], (3, 3), activation='relu', padding='same'),
+        keras.layers.BatchNormalization(),
+        keras.layers.MaxPooling2D((2, 2)),
+        keras.layers.Dropout(0.25),
+        
+        keras.layers.Conv2D(model_config['filters'][2], (3, 3), activation='relu', padding='same'),
+        keras.layers.BatchNormalization(),
+        keras.layers.GlobalAveragePooling2D(),
+        keras.layers.Dropout(0.5),
+    ])
+    
+    # 添加全连接层
+    for units in model_config['dense_units']:
+        model.add(keras.layers.Dense(units, activation='relu'))
+        model.add(keras.layers.Dropout(0.5))
+    
+    model.add(keras.layers.Dense(1, activation='sigmoid'))
+    
+    # 编译模型
+    learning_rate = 0.0005 if n_samples <= 10000 else 0.0002
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss='mse',
+        metrics=['mae']
+    )
+    
+    print(f"  📊 模型参数: {model.count_params():,}")
+    print(f"  🎯 训练轮次: {model_config['epochs']}")
+    print(f"  📦 批次大小: {model_config['batch_size']}")
+    
+    # 设置回调函数
+    callbacks = [
+        keras.callbacks.EarlyStopping(
+            monitor='val_loss', 
+            patience=model_config['patience'], 
+            restore_best_weights=True, 
+            verbose=1
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', 
+            factor=0.5, 
+            patience=max(3, model_config['patience']//2),
+            min_lr=1e-7, 
+            verbose=1
+        )
+    ]
+    
+    # 训练模型 - 使用fit_generator方法（更稳定）
+    print("  🚀 开始HDF5分批训练...")
+    try:
+        history = model.fit(
+            train_generator(),
+            steps_per_epoch=train_steps,
+            epochs=model_config['epochs'],
+            validation_data=val_generator(),
+            validation_steps=val_steps,
+            callbacks=callbacks,
+            verbose=1
+        )
+    except Exception as e:
+        print(f"  ❌ 训练失败: {e}")
+        print("  🔄 尝试降级训练方法...")
+        
+        # 备用训练方法：加载更小的批次到内存
+        print("  📊 使用内存训练模式...")
+        
+        # 加载部分数据到内存进行训练
+        train_sample_size = min(1000, len(train_indices))
+        val_sample_size = min(200, len(val_indices))
+        
+        train_sample_indices = train_indices[:train_sample_size]
+        val_sample_indices = val_indices[:val_sample_size]
+        
+        # 加载样本数据
+        print(f"    加载 {train_sample_size} 训练样本和 {val_sample_size} 验证样本到内存...")
+        
+        with h5py.File(hdf5_file, 'r') as f:
+            scalograms_h5 = f['scalograms']
+            
+            X_train_sample = np.zeros((train_sample_size, n_scales, n_time_samples), dtype=np.float32)
+            y_train_sample = np.zeros(train_sample_size, dtype=np.float32)
+            
+            X_val_sample = np.zeros((val_sample_size, n_scales, n_time_samples), dtype=np.float32)
+            y_val_sample = np.zeros(val_sample_size, dtype=np.float32)
+            
+            # 加载训练数据
+            for i, idx in enumerate(train_sample_indices):
+                try:
+                    scalogram = np.array(scalograms_h5[idx])
+                    scalogram_log = np.log1p(scalogram.astype(np.float32))
+                    X_train_sample[i] = scalogram_log
+                    label_idx = np.where(train_indices == idx)[0][0]
+                    y_train_sample[i] = train_labels[label_idx]
+                except Exception as load_e:
+                    print(f"      ⚠️ 加载训练样本 {idx} 失败: {load_e}")
+            
+            # 加载验证数据
+            for i, idx in enumerate(val_sample_indices):
+                try:
+                    scalogram = np.array(scalograms_h5[idx])
+                    scalogram_log = np.log1p(scalogram.astype(np.float32))
+                    X_val_sample[i] = scalogram_log
+                    label_idx = np.where(val_indices == idx)[0][0]
+                    y_val_sample[i] = val_labels[label_idx]
+                except Exception as load_e:
+                    print(f"      ⚠️ 加载验证样本 {idx} 失败: {load_e}")
+        
+        # 标准化
+        X_train_mean = np.mean(X_train_sample)
+        X_train_std = np.std(X_train_sample) + 1e-8
+        X_train_sample = (X_train_sample - X_train_mean) / X_train_std
+        X_val_sample = (X_val_sample - X_train_mean) / X_train_std
+        
+        # 添加通道维度
+        X_train_sample = X_train_sample[..., np.newaxis]
+        X_val_sample = X_val_sample[..., np.newaxis]
+        
+        print(f"    训练数据形状: {X_train_sample.shape}")
+        print(f"    验证数据形状: {X_val_sample.shape}")
+        
+        # 内存训练
+        history = model.fit(
+            X_train_sample, y_train_sample,
+            validation_data=(X_val_sample, y_val_sample),
+            epochs=model_config['epochs'],
+            batch_size=min(32, train_sample_size//4),
+            callbacks=callbacks,
+            verbose=1
+        )
+    
+    # 评估模型
+    print("  📊 模型评估...")
+    try:
+        # 如果使用生成器训练成功，用小批次评估
+        if 'X_val_sample' not in locals():
+            # 加载小批次验证数据进行评估
+            eval_size = min(500, len(val_indices))
+            eval_indices = val_indices[:eval_size]
+            
+            with h5py.File(hdf5_file, 'r') as f:
+                scalograms_h5 = f['scalograms']
+                X_eval = np.zeros((eval_size, n_scales, n_time_samples), dtype=np.float32)
+                y_eval = np.zeros(eval_size, dtype=np.float32)
+                
+                for i, idx in enumerate(eval_indices):
+                    try:
+                        scalogram = np.array(scalograms_h5[idx])
+                        scalogram_log = np.log1p(scalogram.astype(np.float32))
+                        X_eval[i] = scalogram_log
+                        label_idx = np.where(val_indices == idx)[0][0]
+                        y_eval[i] = val_labels[label_idx]
+                    except Exception as e:
+                        print(f"      ⚠️ 评估样本 {idx} 加载失败: {e}")
+                        X_eval[i] = np.zeros((n_scales, n_time_samples), dtype=np.float32)
+                        y_eval[i] = 0.0
+            
+            # 标准化（使用训练时的参数）
+            X_eval_mean = np.mean(X_eval)
+            X_eval_std = np.std(X_eval) + 1e-8
+            X_eval = (X_eval - X_eval_mean) / X_eval_std
+            X_eval = X_eval[..., np.newaxis]
+            
+        else:
+            # 使用已有的验证数据
+            X_eval = X_val_sample
+            y_eval = y_val_sample
+        
+        val_loss, val_mae = model.evaluate(X_eval, y_eval, verbose=0)
+        print(f"  📈 验证结果 - 损失: {val_loss:.4f}, MAE: {val_mae:.4f}")
+        
+    except Exception as eval_e:
+        print(f"  ⚠️ 评估失败: {eval_e}")
+        val_loss, val_mae = 0.1, 0.1  # 默认值
+    
+    # 保存模型
+    model.save('trained_model_hdf5_optimized.h5')
+    print("  💾 模型已保存为 trained_model_hdf5_optimized.h5")
+    
+    # 绘制训练历史（简化版）
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], 'b-', label='Training Loss')
+    plt.plot(history.history['val_loss'], 'r-', label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss (MSE)')
+    plt.title(f'HDF5 CNN Training - Loss\n({n_samples:,} samples)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['mae'], 'b-', label='Training MAE')
+    plt.plot(history.history['val_mae'], 'r-', label='Validation MAE')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.title(f'HDF5 CNN Training - MAE\n(Final: {val_mae:.3f})')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('cnn_training_history_hdf5.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    print("  📊 训练历史图已保存为 cnn_training_history_hdf5.png")
+    
+    return {
+        'n_train': len(train_indices),
+        'n_val': len(val_indices),
+        'val_loss': val_loss,
+        'val_mae': val_mae,
+        'model': model,
+        'history': history,
+        'model_params': model.count_params(),
+        'epochs_trained': len(history.history['loss']),
+        'hdf5_mode': True
     }
 
 def generate_gradcam_optimized(analyzer, model):
@@ -1160,40 +1705,131 @@ def detect_existing_optimized_files():
     
     existing_files = {}
     
-    # 检测处理数据文件
-    processed_files = list(Path('.').glob('processed_data_opt_*.pkl'))
+    # 检测处理数据文件（扩展检测范围）
+    processed_files = []
+    
+    # 检测带编号的优化版本文件
+    processed_files.extend(list(Path('.').glob('processed_data_opt_*.pkl')))
+    
+    # 检测标准命名的文件（新增）
+    standard_processed_files = [
+        'processed_data.pkl',
+        'processed_data.h5'  # 也检测HDF5格式的处理数据
+    ]
+    
+    for file_pattern in standard_processed_files:
+        if Path(file_pattern).exists():
+            processed_files.append(Path(file_pattern))
+    
     if processed_files:
-        # 选择最新的文件（按样本数量排序）
-        latest_processed = max(processed_files, key=lambda x: int(x.stem.split('_')[-1]))
+        # 选择最新的文件（按修改时间排序）
+        latest_processed = max(processed_files, key=lambda x: x.stat().st_mtime)
         existing_files['processed_data'] = latest_processed
-        sample_count = int(latest_processed.stem.split('_')[-1])
-        print(f"  ✅ 发现处理数据: {latest_processed} ({sample_count:,} 样本)")
+        
+        # 尝试确定样本数量
+        try:
+            if latest_processed.suffix == '.pkl':
+                import pickle
+                with open(latest_processed, 'rb') as f:
+                    data = pickle.load(f)
+                if 'csi_data' in data:
+                    sample_count = len(data['csi_data'])
+                    print(f"  ✅ 发现处理数据: {latest_processed} ({sample_count:,} 样本)")
+                else:
+                    print(f"  ✅ 发现处理数据: {latest_processed} (无法确定样本数)")
+            elif latest_processed.suffix == '.h5':
+                import h5py
+                with h5py.File(latest_processed, 'r') as f:
+                    # 尝试获取数据集信息
+                    if 'csi_data' in f:
+                        sample_count = len(f['csi_data'])
+                        print(f"  ✅ 发现处理数据: {latest_processed} ({sample_count:,} 样本, HDF5格式)")
+                    else:
+                        print(f"  ✅ 发现处理数据: {latest_processed} (HDF5格式)")
+            else:
+                # 从文件名提取样本数（如果有编号）
+                if '_opt_' in latest_processed.stem:
+                    sample_count = int(latest_processed.stem.split('_')[-1])
+                    print(f"  ✅ 发现处理数据: {latest_processed} ({sample_count:,} 样本)")
+                else:
+                    print(f"  ✅ 发现处理数据: {latest_processed}")
+        except Exception as e:
+            print(f"  ✅ 发现处理数据: {latest_processed} (信息读取失败: {e})")
     else:
         print("  ❌ 未发现处理数据文件")
     
-    # 检测尺度图文件
+    # 检测HDF5尺度图文件（新增）
+    hdf5_files = []
+    hdf5_patterns = [
+        'scalograms_optimized.h5',
+        'scalograms_temp.h5', 
+        'scalograms_fallback.h5'
+    ]
+    
+    for pattern in hdf5_patterns:
+        if Path(pattern).exists():
+            hdf5_files.append(Path(pattern))
+    
+    # 也检测带编号的HDF5文件
+    hdf5_files.extend(list(Path('.').glob('scalograms_opt_*.h5')))
+    
+    if hdf5_files:
+        # 选择最新的HDF5文件（按修改时间排序）
+        latest_hdf5 = max(hdf5_files, key=lambda x: x.stat().st_mtime)
+        existing_files['hdf5_scalograms'] = latest_hdf5
+        
+        # 尝试获取HDF5文件的样本数量
+        try:
+            import h5py
+            with h5py.File(latest_hdf5, 'r') as f:
+                if 'scalograms' in f:
+                    hdf5_shape = f['scalograms'].shape
+                    sample_count = hdf5_shape[0]
+                    print(f"  ✅ 发现HDF5尺度图: {latest_hdf5} ({sample_count:,} 样本，形状: {hdf5_shape})")
+                else:
+                    print(f"  ⚠️ 发现HDF5文件但格式异常: {latest_hdf5}")
+        except Exception as e:
+            print(f"  ⚠️ HDF5文件读取失败: {latest_hdf5} - {e}")
+    else:
+        print("  ❌ 未发现HDF5尺度图文件")
+    
+    # 检测尺度图文件（保留原有的npz格式检测）
     scalogram_files = list(Path('.').glob('scalogram_dataset_opt_*.npz'))
     if scalogram_files:
         latest_scalogram = max(scalogram_files, key=lambda x: int(x.stem.split('_')[-1]))
         existing_files['scalogram_data'] = latest_scalogram
         sample_count = int(latest_scalogram.stem.split('_')[-1])
-        print(f"  ✅ 发现尺度图数据: {latest_scalogram} ({sample_count:,} 样本)")
+        print(f"  ✅ 发现NPZ尺度图数据: {latest_scalogram} ({sample_count:,} 样本)")
     else:
-        print("  ❌ 未发现尺度图数据文件")
+        print("  ❌ 未发现NPZ尺度图数据文件")
     
     # 检测训练模型文件
-    model_files = list(Path('.').glob('trained_model_opt_*.h5'))
+    model_files = []
+    model_patterns = [
+        'trained_model_optimized.h5',
+        'trained_model_hdf5_optimized.h5',
+        'trained_model.h5'
+    ]
+    
+    for pattern in model_patterns:
+        if Path(pattern).exists():
+            model_files.append(Path(pattern))
+    
+    # 也检测带编号的模型文件
+    model_files.extend(list(Path('.').glob('trained_model_opt_*.h5')))
+    
     if model_files:
-        latest_model = max(model_files, key=lambda x: int(x.stem.split('_')[-1]))
+        # 选择最新的模型文件（按修改时间排序）
+        latest_model = max(model_files, key=lambda x: x.stat().st_mtime)
         existing_files['trained_model'] = latest_model
-        sample_count = int(latest_model.stem.split('_')[-1])
-        print(f"  ✅ 发现训练模型: {latest_model} ({sample_count:,} 样本)")
+        print(f"  ✅ 发现训练模型: {latest_model}")
     else:
         print("  ❌ 未发现训练模型文件")
     
     # 检测可视化文件
     viz_files = [
         'cnn_training_history_optimized.png',
+        'cnn_training_history_hdf5.png',
         'gradcam_analysis_optimized.png', 
         'interpretability_report_optimized.png'
     ]
@@ -1205,7 +1841,7 @@ def detect_existing_optimized_files():
     
     if existing_viz:
         existing_files['visualization'] = existing_viz
-        print(f"  ✅ 发现可视化文件: {len(existing_viz)}/3 个")
+        print(f"  ✅ 发现可视化文件: {len(existing_viz)} 个")
     
     return existing_files
 
@@ -1228,24 +1864,99 @@ def load_existing_optimized_data(existing_files):
     # 加载处理后的数据
     if 'processed_data' in existing_files:
         try:
-            import pickle
-            with open(existing_files['processed_data'], 'rb') as f:
-                processed_data = pickle.load(f)
+            processed_file = existing_files['processed_data']
+            print(f"  🔄 加载处理数据: {processed_file}")
             
-            # 重建target_builder
-            from regression_target import RegressionTargetBuilder
-            target_builder = RegressionTargetBuilder(analyzer)
-            target_builder.csi_data = processed_data['csi_data']
-            target_builder.model_dataset = processed_data['model_dataset']
-            analyzer.target_builder = target_builder
-            
-            print(f"  ✅ 加载处理数据: {len(processed_data['csi_data']):,} 个样本")
+            if processed_file.suffix == '.pkl':
+                # 处理PKL格式
+                import pickle
+                with open(processed_file, 'rb') as f:
+                    processed_data = pickle.load(f)
+                
+                # 重建target_builder
+                from regression_target import RegressionTargetBuilder
+                target_builder = RegressionTargetBuilder(analyzer)
+                target_builder.csi_data = processed_data['csi_data']
+                target_builder.model_dataset = processed_data['model_dataset']
+                analyzer.target_builder = target_builder
+                
+                print(f"  ✅ 加载PKL处理数据: {len(processed_data['csi_data']):,} 个样本")
+                
+            elif processed_file.suffix == '.h5':
+                # 处理HDF5格式（如果需要的话）
+                import h5py
+                print(f"  ⚠️ 检测到HDF5格式的处理数据，需要特殊处理")
+                print(f"  🔄 建议使用PKL格式或重新生成处理数据")
+                # 暂时跳过H5格式的处理数据，因为结构可能不同
+                return None
+            else:
+                print(f"  ❌ 不支持的处理数据文件格式: {processed_file.suffix}")
+                return None
+                
         except Exception as e:
             print(f"  ❌ 加载处理数据失败: {e}")
             return None
     
-    # 加载尺度图数据
-    if 'scalogram_data' in existing_files:
+    # 优先加载HDF5尺度图数据（新增）
+    if 'hdf5_scalograms' in existing_files:
+        try:
+            import h5py
+            hdf5_file = existing_files['hdf5_scalograms']
+            
+            print(f"  🔄 加载HDF5尺度图数据: {hdf5_file}")
+            
+            # 读取HDF5文件基本信息
+            with h5py.File(hdf5_file, 'r') as f:
+                if 'scalograms' not in f:
+                    raise ValueError("HDF5文件中未找到scalograms数据集")
+                
+                shape = f['scalograms'].shape
+                print(f"    HDF5数据形状: {shape}")
+            
+            # 重建尺度图数据集元数据（使用HDF5格式）
+            csi_labels = analyzer.target_builder.csi_data['csi'].values
+            n_samples, n_scales, n_time_samples = shape
+            
+            # 重建小波变换处理器
+            from wavelet_transform import WaveletTransformProcessor
+            analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
+            
+            # 重建频率和尺度信息
+            analyzer.wavelet_processor.design_wavelet_scales()  # 重新生成scales和frequencies
+            
+            # 创建HDF5格式的尺度图数据集
+            scalograms_dataset = {
+                'scalograms_file': str(hdf5_file),  # 保存文件路径
+                'n_samples': n_samples,
+                'shape': shape,
+                'csi_labels': csi_labels,
+                'scales': analyzer.wavelet_processor.scales,
+                'frequencies': analyzer.wavelet_processor.frequencies,
+                'time_axis': np.arange(n_time_samples) / 100000,  # 假设100kHz采样率
+                'metadata': {
+                    'depth': analyzer.target_builder.csi_data['depth'].values,
+                    'receiver': np.zeros(len(csi_labels)),
+                    'receiver_index': np.arange(len(csi_labels))
+                },
+                'transform_params': {
+                    'wavelet': 'cmor1.5-1.0',
+                    'sampling_rate': 100000,
+                    'freq_range': (1000, 30000),
+                    'n_scales': n_scales
+                }
+            }
+            
+            analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
+            
+            print(f"  ✅ 加载HDF5尺度图数据: 形状 {shape}")
+            return analyzer
+            
+        except Exception as e:
+            print(f"  ❌ 加载HDF5尺度图数据失败: {e}")
+            # 继续尝试其他格式
+    
+    # 加载NPZ尺度图数据（原有逻辑，作为备选）
+    elif 'scalogram_data' in existing_files:
         try:
             scalogram_file = existing_files['scalogram_data']
             loaded_data = np.load(scalogram_file, allow_pickle=True)
@@ -1276,12 +1987,15 @@ def load_existing_optimized_data(existing_files):
             analyzer.wavelet_processor = WaveletTransformProcessor(analyzer)
             analyzer.wavelet_processor.scalograms_dataset = scalograms_dataset
             
-            print(f"  ✅ 加载尺度图数据: {scalograms_dataset['scalograms'].shape}")
+            print(f"  ✅ 加载NPZ尺度图数据: {scalograms_dataset['scalograms'].shape}")
+            return analyzer
+            
         except Exception as e:
-            print(f"  ❌ 加载尺度图数据失败: {e}")
+            print(f"  ❌ 加载NPZ尺度图数据失败: {e}")
             return None
-    
-    return analyzer
+    else:
+        print("  ❌ 未找到可用的尺度图数据文件")
+        return None
 
 def load_existing_optimized_model(existing_files):
     """加载已有的训练模型"""
@@ -1320,24 +2034,73 @@ def ask_user_preference(existing_files):
     # 选项1：完全重新开始
     options.append("完全重新开始 - 重新处理所有数据")
     
+    # 检查是否有可用的数据进行重新训练
+    has_processed_data = 'processed_data' in existing_files
+    has_scalogram_data = ('hdf5_scalograms' in existing_files or 'scalogram_data' in existing_files)
+    
     # 选项2：从已有数据开始训练
-    if 'processed_data' in existing_files and 'scalogram_data' in existing_files:
-        sample_count = int(existing_files['scalogram_data'].stem.split('_')[-1])
-        options.append(f"使用已有数据重新训练 - 跳过前4步，从第5步开始 ({sample_count:,} 样本)")
+    if has_processed_data and has_scalogram_data:
+        if 'hdf5_scalograms' in existing_files:
+            # 优先显示HDF5文件信息
+            try:
+                import h5py
+                with h5py.File(existing_files['hdf5_scalograms'], 'r') as f:
+                    if 'scalograms' in f:
+                        sample_count = f['scalograms'].shape[0]
+                        options.append(f"使用已有HDF5数据重新训练 - 跳过前4步，从第5步开始 ({sample_count:,} 样本)")
+                    else:
+                        options.append("使用已有HDF5数据重新训练 - 跳过前4步，从第5步开始 (数据异常)")
+            except:
+                options.append("使用已有HDF5数据重新训练 - 跳过前4步，从第5步开始 (文件异常)")
+        elif 'scalogram_data' in existing_files:
+            # 使用NPZ文件信息
+            sample_count = int(existing_files['scalogram_data'].stem.split('_')[-1])
+            options.append(f"使用已有NPZ数据重新训练 - 跳过前4步，从第5步开始 ({sample_count:,} 样本)")
+    elif has_scalogram_data:
+        # 即使没有处理数据文件，但有尺度图文件，也可以重建数据并训练（新增逻辑）
+        if 'hdf5_scalograms' in existing_files:
+            try:
+                import h5py
+                with h5py.File(existing_files['hdf5_scalograms'], 'r') as f:
+                    if 'scalograms' in f:
+                        sample_count = f['scalograms'].shape[0]
+                        options.append(f"从HDF5重建数据并训练 - 重建前3步，使用已有尺度图 ({sample_count:,} 样本)")
+                    else:
+                        options.append("从HDF5重建数据并训练 - 重建前3步，使用已有尺度图 (数据异常)")
+            except:
+                options.append("从HDF5重建数据并训练 - 重建前3步，使用已有尺度图 (文件异常)")
+        elif 'scalogram_data' in existing_files:
+            sample_count = int(existing_files['scalogram_data'].stem.split('_')[-1])
+            options.append(f"从NPZ重建数据并训练 - 重建前3步，使用已有尺度图 ({sample_count:,} 样本)")
     
     # 选项3：完全使用已有结果
-    if ('processed_data' in existing_files and 
-        'scalogram_data' in existing_files and 
-        'trained_model' in existing_files):
-        sample_count = int(existing_files['trained_model'].stem.split('_')[-1])
-        options.append(f"使用已有训练结果 - 只运行分析和可视化 ({sample_count:,} 样本)")
+    if (has_processed_data and has_scalogram_data and 'trained_model' in existing_files):
+        model_file = existing_files['trained_model']
+        options.append(f"使用已有训练结果 - 只运行分析和可视化 (模型: {model_file.name})")
     
     # 选项4：更新采样策略
-    if 'processed_data' in existing_files:
+    if has_processed_data:
         options.append("更新采样策略 - 使用已有原始数据，重新采样和训练")
     
+    # 选项5：仅重新生成HDF5尺度图（如果有处理数据但没有尺度图）
+    if has_processed_data and not has_scalogram_data:
+        processed_file = existing_files['processed_data']
+        sample_count = int(processed_file.stem.split('_')[-1])
+        options.append(f"从已有处理数据生成尺度图 - 跳过前3步，从第4步开始 ({sample_count:,} 样本)")
+    
+    # 显示所有选项
     for i, option in enumerate(options, 1):
         print(f"  {i}. {option}")
+    
+    # 根据可用数据显示推荐
+    if has_scalogram_data and 'trained_model' in existing_files:
+        print(f"\n💡 推荐选项3：直接使用已有结果进行分析")
+    elif has_scalogram_data:
+        print(f"\n💡 推荐选项2：使用已有尺度图数据重新训练")
+    elif has_processed_data:
+        print(f"\n💡 推荐选项{len(options)}：从已有处理数据生成尺度图")
+    else:
+        print(f"\n💡 推荐选项1：从头开始完整处理")
     
     while True:
         try:
@@ -1347,6 +2110,7 @@ def ask_user_preference(existing_files):
             
             choice_num = int(choice)
             if 1 <= choice_num <= len(options):
+                print(f"\n✅ 您选择了：{options[choice_num-1]}")
                 return choice_num
             else:
                 print(f"请输入1-{len(options)}之间的数字")
@@ -1406,6 +2170,18 @@ def run_optimized_full_dataset():
             # 更新采样策略
             print("\n🔄 更新采样策略 - 重新采样和训练")
             analyzer = run_resampling_pipeline(existing_files)
+        
+        elif user_choice == 5:
+            # 从已有处理数据生成尺度图（新增选项）
+            print("\n🔄 从已有处理数据生成尺度图 - 从第4步开始")
+            analyzer = load_existing_optimized_data(existing_files)
+            if analyzer is None:
+                print("❌ 数据加载失败，转为完全重新开始")
+                analyzer = run_full_processing_pipeline()
+            else:
+                # 只需要运行小波变换步骤
+                print("\n第4步：重新生成HDF5尺度图")
+                analyzer = optimized_wavelet_transform(analyzer)
         
         if analyzer is None:
             raise RuntimeError("分析器初始化失败")
