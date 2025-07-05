@@ -2314,9 +2314,12 @@ def generate_comprehensive_gradcam_report(results):
         table[(0, i)].set_facecolor('#40466e')
         table[(0, i)].set_text_props(weight='bold', color='white')
     
+    # 定义正确的浅色背景色
+    light_colors = ['#90EE90', '#ADD8E6', '#FFE4B5', '#FFB6C1']  # 浅绿、浅蓝、浅橙、浅红
+    
     for i, cat in enumerate(categories):
         for j in range(len(headers)):
-            table[(i+1, j)].set_facecolor(colors[i] + '20')  # 浅色背景
+            table[(i+1, j)].set_facecolor(light_colors[i])
     
     # 总计行特殊样式
     for j in range(len(headers)):
